@@ -1,0 +1,30 @@
+[package]
+name = "r5e-verify-rs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+[lib]
+name = "r5e_verify_rs"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+[[bin]]
+name = "recurse_verify"
+path = "src/main.rs"
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+sha2 = "0.10"
+base64 = "0.22"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+p256 = { version = "0.13", default-features = false, features = ["alloc", "ecdsa"] }
+p384 = { version = "0.13", default-features = false, features = ["alloc", "ecdsa"] }
+regex = "1"
+fancy-regex = "0.20"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["custom"] }
+
+[profile.release]
+strip = "symbols"
+lto = "thin"

@@ -1,0 +1,261 @@
+{
+  "$defs": {
+    "common": {
+      "$defs": {
+        "AttachmentRef": {
+          "$comment": "Request-local token only; name must resolve uniquely and normalize to a bytes: ref before final validation/signing.",
+          "pattern": "^attachment:[^\\s]+$",
+          "type": "string"
+        },
+        "Base64": {
+          "$comment": "Canonical pad bits and decoded content require semantic checking.",
+          "contentEncoding": "base64",
+          "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+          "type": "string"
+        },
+        "BytesRef": {
+          "pattern": "^bytes:sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "Digest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "EventRef": {
+          "pattern": "^event:sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "EvidenceRef": {
+          "pattern": "^evidence:sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "ExactRef": {
+          "pattern": "^(?:evidence|bytes|event):sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "Frontier": {
+          "$comment": "Sort by stream ID; exactly one head per stream. JSON Schema cannot enforce uniqueness by stream or cross-record agreement.",
+          "items": {
+            "$ref": "#/$defs/common/$defs/FrontierEntry"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "FrontierEntry": {
+          "additionalProperties": false,
+          "properties": {
+            "event": {
+              "$ref": "#/$defs/common/$defs/EvidenceRef"
+            },
+            "seq": {
+              "$ref": "#/$defs/common/$defs/Position"
+            },
+            "stream": {
+              "$ref": "#/$defs/common/$defs/IdentityURI"
+            }
+          },
+          "required": [
+            "stream",
+            "seq",
+            "event"
+          ],
+          "type": "object"
+        },
+        "IdentityURI": {
+          "$comment": "The selected profile declares which stable URI schemes/identities it accepts; syntax is not authentication.",
+          "format": "uri",
+          "pattern": "^(?!evidence:|bytes:|event:|attachment:)[A-Za-z][A-Za-z0-9+.-]*:[^\\s]+$",
+          "type": "string"
+        },
+        "JSONValue": {
+          "$comment": "Core additionally rejects lexical floating-point numbers, duplicate keys and invalid Unicode; ordinary JSON Schema operates on already parsed values.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "$ref": "#/$defs/common/$defs/JSONValue"
+              },
+              "type": "array"
+            },
+            {
+              "additionalProperties": {
+                "$ref": "#/$defs/common/$defs/JSONValue"
+              },
+              "type": "object"
+            }
+          ]
+        },
+        "KeyID": {
+          "pattern": "^key:[a-z0-9-]+:sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "Position": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "ResponseOutcome": {
+          "enum": [
+            "completed",
+            "failed",
+            "denied",
+            "cancelled",
+            "partial",
+            "unknown"
+          ]
+        },
+        "SessionOutcome": {
+          "enum": [
+            "completed",
+            "interrupted",
+            "failed",
+            "unknown"
+          ]
+        },
+        "Timestamp": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "UTCTimestamp": {
+          "format": "date-time",
+          "pattern": "Z$",
+          "type": "string"
+        }
+      },
+      "title": "Provenance v2 common values"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "$comment": "Common Evidence envelope with Amendment A1 applied: apiVersion is the kind's API group and version, kind is a bare name within it. Passing this schema does not validate body semantics, installed definitions or profiles.",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "properties": {
+              "previous": {
+                "$ref": "#/$defs/common/$defs/EvidenceRef"
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "seq": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "previous": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/common/$defs/IdentityURI"
+        },
+        "apiVersion": {
+          "pattern": "^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?/v[0-9]+(?:(?:alpha|beta)[0-9]+)?$",
+          "type": "string"
+        },
+        "body": {
+          "additionalProperties": {
+            "$ref": "#/$defs/common/$defs/JSONValue"
+          },
+          "type": "object"
+        },
+        "capturedAt": {
+          "$ref": "#/$defs/common/$defs/UTCTimestamp"
+        },
+        "causes": {
+          "$comment": "Additional explicit causal evidence from authenticated host context and caller hints, sorted by reference and unique. Typed body links retain their own relationship meaning; arbitrary EvidenceRefs do not imply causality.",
+          "items": {
+            "$ref": "#/$defs/common/$defs/EvidenceRef"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "contextRefs": {
+          "items": {
+            "$ref": "#/$defs/common/$defs/ExactRef"
+          },
+          "type": "array"
+        },
+        "identityRef": {
+          "$ref": "#/$defs/common/$defs/ExactRef"
+        },
+        "issuer": {
+          "$ref": "#/$defs/common/$defs/KeyID"
+        },
+        "kind": {
+          "pattern": "^[A-Z][A-Za-z0-9]*$",
+          "type": "string"
+        },
+        "occurredAt": {
+          "$ref": "#/$defs/common/$defs/Timestamp"
+        },
+        "onBehalfOf": {
+          "$ref": "#/$defs/common/$defs/IdentityURI"
+        },
+        "previous": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/common/$defs/EvidenceRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "profileRef": {
+          "$ref": "#/$defs/common/$defs/BytesRef"
+        },
+        "schemaRef": {
+          "$ref": "#/$defs/common/$defs/BytesRef"
+        },
+        "seq": {
+          "$ref": "#/$defs/common/$defs/Position"
+        },
+        "session": {
+          "$ref": "#/$defs/common/$defs/IdentityURI"
+        },
+        "stream": {
+          "$ref": "#/$defs/common/$defs/IdentityURI"
+        },
+        "subject": {
+          "$ref": "#/$defs/common/$defs/ExactRef"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "schemaRef",
+        "profileRef",
+        "issuer",
+        "actor",
+        "stream",
+        "seq",
+        "previous",
+        "capturedAt",
+        "body"
+      ],
+      "title": "Provenance v2 common Evidence envelope",
+      "type": "object"
+    }
+  ]
+}
