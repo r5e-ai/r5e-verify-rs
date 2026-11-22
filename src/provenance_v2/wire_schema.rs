@@ -1,4 +1,6 @@
-use super::canonical::{is_valid_wire_datetime, parse_v2_integer};
+use super::canonical::{
+    is_bytes_ref, is_evidence_ref, is_salted_bytes_ref, is_valid_wire_datetime, parse_v2_integer,
+};
 use serde_json::Value;
 use std::sync::LazyLock;
 
@@ -47,6 +49,12 @@ pub enum WireSchemaKind {
 }
 
 pub fn validate_wire_schema(kind: WireSchemaKind, instance: &Value) -> bool {
+    if matches!(kind, WireSchemaKind::Export)
+        && let Some(obj) = instance.as_object()
+        && A11_EXPORT_MEMBERS.iter().any(|k| obj.contains_key(*k))
+    {
+        return validate_a11_export_bundle(obj);
+    }
     let root = match kind {
         WireSchemaKind::Export => &*EXPORT_SCHEMA,
         WireSchemaKind::SignedEvidence => &*SIGNED_EVIDENCE_SCHEMA,
@@ -55,6 +63,150 @@ pub fn validate_wire_schema(kind: WireSchemaKind, instance: &Value) -> bool {
         WireSchemaKind::EpochManifest => &*EPOCH_MANIFEST_SCHEMA,
     };
     validate_against_schema(root, instance)
+}
+
+const A11_EXPORT_MEMBERS: [&str; 4] = [
+    "saltedContent",
+    "witnessReceipts",
+    "unlockLog",
+    "pinnedCheckpoints",
+];
+
+fn validate_a11_export_bundle(obj: &serde_json::Map<String, Value>) -> bool {
+    if let Some(sc) = obj.get("saltedContent")
+        && !validate_salted_content_member(sc)
+    {
+        return false;
+    }
+    if let Some(wr) = obj.get("witnessReceipts")
+        && !validate_witness_receipts_member(wr)
+    {
+        return false;
+    }
+    if let Some(ul) = obj.get("unlockLog")
+        && !validate_unlock_log_member(ul)
+    {
+        return false;
+    }
+    if let Some(pc) = obj.get("pinnedCheckpoints")
+        && !validate_pinned_checkpoints_member(pc)
+    {
+        return false;
+    }
+
+    let mut base_obj = serde_json::Map::with_capacity(obj.len());
+    for (k, v) in obj {
+        if !A11_EXPORT_MEMBERS.contains(&k.as_str()) {
+            base_obj.insert(k.clone(), v.clone());
+        }
+    }
+    validate_against_schema(&EXPORT_SCHEMA, &Value::Object(base_obj))
+}
+
+fn validate_salted_content_member(v: &Value) -> bool {
+    let Some(map) = v.as_object() else {
+        return false;
+    };
+    for (k, entry) in map {
+        if !is_salted_bytes_ref(k) {
+            return false;
+        }
+        let Some(eobj) = entry.as_object() else {
+            return false;
+        };
+        if eobj.len() != 2 {
+            return false;
+        }
+        if !eobj.get("salt").is_some_and(Value::is_string)
+            || !eobj.get("bytes").is_some_and(Value::is_string)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_witness_receipts_member(v: &Value) -> bool {
+    let Some(map) = v.as_object() else {
+        return false;
+    };
+    for (k, entry) in map {
+        if !is_bytes_ref(k) {
+            return false;
+        }
+        let Some(eobj) = entry.as_object() else {
+            return false;
+        };
+        if eobj.len() != 6 {
+            return false;
+        }
+        let log_index_ok = eobj
+            .get("logIndex")
+            .and_then(parse_v2_integer)
+            .is_some_and(|n| n >= 0);
+        if !log_index_ok
+            || !eobj.get("loggedAt").is_some_and(Value::is_string)
+            || !eobj.get("requestHash").is_some_and(Value::is_string)
+            || !eobj.get("requestRef").is_some_and(Value::is_string)
+            || !eobj.get("signature").is_some_and(Value::is_string)
+            || !eobj.get("witnessKey").is_some_and(Value::is_string)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_unlock_log_member(v: &Value) -> bool {
+    let Some(arr) = v.as_array() else {
+        return false;
+    };
+    for entry in arr {
+        let Some(eobj) = entry.as_object() else {
+            return false;
+        };
+        if eobj.len() != 5 {
+            return false;
+        }
+        let release_ref_ok = eobj
+            .get("releaseRef")
+            .is_some_and(|rv| rv.is_null() || rv.is_string());
+        if !release_ref_ok
+            || !eobj.get("entryId").is_some_and(Value::is_string)
+            || !eobj.get("operatorKey").is_some_and(Value::is_string)
+            || !eobj.get("session").is_some_and(Value::is_string)
+            || !eobj.get("unlockedAt").is_some_and(Value::is_string)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_pinned_checkpoints_member(v: &Value) -> bool {
+    let Some(arr) = v.as_array() else {
+        return false;
+    };
+    for entry in arr {
+        let Some(eobj) = entry.as_object() else {
+            return false;
+        };
+        if eobj.len() != 2 {
+            return false;
+        }
+        let ref_ok = eobj
+            .get("ref")
+            .and_then(Value::as_str)
+            .is_some_and(is_evidence_ref);
+        let seq_ok = eobj
+            .get("seq")
+            .and_then(parse_v2_integer)
+            .is_some_and(|n| n >= 1);
+        if !ref_ok || !seq_ok {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn validate_against_schema(root: &Value, instance: &Value) -> bool {

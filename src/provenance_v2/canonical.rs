@@ -46,6 +46,11 @@ pub fn is_bytes_ref(s: &str) -> bool {
     s.strip_prefix("bytes:sha256:").is_some_and(is_lower_hex_64)
 }
 
+pub fn is_salted_bytes_ref(s: &str) -> bool {
+    s.strip_prefix("bytes:sha256+salt:")
+        .is_some_and(is_lower_hex_64)
+}
+
 pub fn is_event_ref(s: &str) -> bool {
     s.strip_prefix("event:sha256:").is_some_and(is_lower_hex_64)
 }
@@ -57,6 +62,15 @@ pub fn is_evidence_ref(s: &str) -> bool {
 
 pub fn bytes_ref_of(data: &[u8]) -> String {
     format!("bytes:sha256:{}", hex_encode(&sha256_bytes(data)))
+}
+
+pub fn salted_bytes_ref_of(salt: &[u8], plaintext: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"r5e-salted-content-v1\0");
+    hasher.update(salt);
+    hasher.update(plaintext);
+    let digest: [u8; 32] = hasher.finalize().into();
+    format!("bytes:sha256+salt:{}", hex_encode(&digest))
 }
 
 pub fn evidence_ref_of(payload_bytes: &[u8]) -> String {

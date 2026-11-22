@@ -1,3 +1,4 @@
+pub mod a11;
 pub mod authority;
 pub mod canonical;
 pub mod crypto;
@@ -6,6 +7,8 @@ pub mod retention;
 pub mod start;
 pub mod wasm_ffi;
 pub mod wire_schema;
+
+pub use a11::{A11Finding, A11Report, FindingCategory, classify_finding};
 
 use canonical::{
     MAX_SAFE_INT, bytes_ref_of, decode_base64, decode_hex_32, decode_strict_base64,
@@ -566,9 +569,21 @@ pub fn verify_bundle_bytes(
     Ok(verify_bundle_value(&bundle_val, opts))
 }
 
-struct AvailableKey {
-    algorithm: String,
-    bytes: Vec<u8>,
+/// Parses raw bundle JSON bytes strictly and verifies both baseline Provenance v2
+/// rules and Amendment A11 rules (V1–V11) offline with zero OS/clock calls.
+pub fn verify_bundle_a11_bytes(
+    bundle_bytes: &[u8],
+    opts: &VerifyOptions,
+) -> Result<A11Report, InputError> {
+    opts.validate()?;
+    let bundle_val = strict_json_parse(bundle_bytes)
+        .ok_or_else(|| InputError("bundle is not readable JSON".into()))?;
+    Ok(verify_bundle_a11_value(&bundle_val, opts))
+}
+
+pub(crate) struct AvailableKey {
+    pub(crate) algorithm: String,
+    pub(crate) bytes: Vec<u8>,
 }
 
 pub(crate) struct OpenedRecord {
@@ -652,8 +667,40 @@ fn has_matching_sealer_binding(
     })
 }
 
+struct CoreVerifyOutput {
+    report: Report,
+    opened_records: Vec<OpenedRecord>,
+    opened_by_ref: BTreeMap<String, usize>,
+    body_result_by_idx: Vec<String>,
+    available_keys: BTreeMap<String, AvailableKey>,
+    valid_blobs: BTreeMap<String, Vec<u8>>,
+}
+
 /// Core pure verification entry point (`VERIFY-V2.md` §§3–9).
 pub fn verify_bundle_value(bundle: &Value, opts: &VerifyOptions) -> Report {
+    verify_bundle_core(bundle, opts).report
+}
+
+/// Core pure verification entry point with Amendment A11 rules (V1–V11).
+pub fn verify_bundle_a11_value(bundle: &Value, opts: &VerifyOptions) -> A11Report {
+    let base_defs = opts
+        .base_definitions
+        .as_ref()
+        .unwrap_or_else(|| default_base_definitions());
+    let core = verify_bundle_core(bundle, opts);
+    let ctx = a11::A11EvalContext {
+        bundle,
+        opened_records: &core.opened_records,
+        opened_by_ref: &core.opened_by_ref,
+        body_result_by_idx: &core.body_result_by_idx,
+        available_keys: &core.available_keys,
+        valid_blobs: &core.valid_blobs,
+        base_defs,
+    };
+    a11::evaluate_a11(&ctx, core.report)
+}
+
+fn verify_bundle_core(bundle: &Value, opts: &VerifyOptions) -> CoreVerifyOutput {
     let base_defs = opts
         .base_definitions
         .as_ref()
@@ -661,14 +708,21 @@ pub fn verify_bundle_value(bundle: &Value, opts: &VerifyOptions) -> Report {
 
     // §3. The bundle
     if !validate_wire_schema(WireSchemaKind::Export, bundle) {
-        return Report::from_findings(vec![Finding::new(
-            1,
-            "bundle",
-            "shape",
-            "failed",
-            "malformed_bundle",
-            None,
-        )]);
+        return CoreVerifyOutput {
+            report: Report::from_findings(vec![Finding::new(
+                1,
+                "bundle",
+                "shape",
+                "failed",
+                "malformed_bundle",
+                None,
+            )]),
+            opened_records: Vec::new(),
+            opened_by_ref: BTreeMap::new(),
+            body_result_by_idx: Vec::new(),
+            available_keys: BTreeMap::new(),
+            valid_blobs: BTreeMap::new(),
+        };
     }
 
     let records_arr = bundle["records"].as_array().expect("export schema checked");
@@ -677,14 +731,21 @@ pub fn verify_bundle_value(bundle: &Value, opts: &VerifyOptions) -> Report {
         for entry in records_arr {
             let r = entry["ref"].as_str().expect("export schema checked");
             if !seen_record_refs.insert(r) {
-                return Report::from_findings(vec![Finding::new(
-                    1,
-                    "bundle",
-                    "shape",
-                    "failed",
-                    "malformed_bundle",
-                    None,
-                )]);
+                return CoreVerifyOutput {
+                    report: Report::from_findings(vec![Finding::new(
+                        1,
+                        "bundle",
+                        "shape",
+                        "failed",
+                        "malformed_bundle",
+                        None,
+                    )]),
+                    opened_records: Vec::new(),
+                    opened_by_ref: BTreeMap::new(),
+                    body_result_by_idx: Vec::new(),
+                    available_keys: BTreeMap::new(),
+                    valid_blobs: BTreeMap::new(),
+                };
             }
         }
     }
@@ -1492,7 +1553,35 @@ pub fn verify_bundle_value(bundle: &Value, opts: &VerifyOptions) -> Report {
         &mut findings,
     );
 
-    Report::from_findings_and_start(findings, start_eval.report_start)
+    CoreVerifyOutput {
+        report: Report::from_findings_and_start(findings, start_eval.report_start),
+        opened_records,
+        opened_by_ref,
+        body_result_by_idx,
+        available_keys,
+        valid_blobs,
+    }
+}
+
+fn signature_count_matches_definition(rec: &OpenedRecord, parsed_def: &ParsedDefinition) -> bool {
+    let n = rec.signers.len();
+    if parsed_def.signatures == 1 {
+        match parsed_def.kind.as_str() {
+            "provenance.r5e.io/v2/Basis" | "provenance.r5e.io/v2/BasisOverlay" => n == 1 || n == 2,
+            "provenance.r5e.io/v2/ReleaseRequest" => n >= 1,
+            "provenance.r5e.io/v2/Succession" => {
+                let has_recovery = rec
+                    .payload
+                    .get("body")
+                    .and_then(|b| b.get("recoveryProof"))
+                    .is_some();
+                if has_recovery { n == 1 } else { n == 2 }
+            }
+            _ => n == 1,
+        }
+    } else {
+        n == parsed_def.signatures
+    }
 }
 
 fn has_multi_signer_count_mismatch(
@@ -1635,7 +1724,7 @@ fn check_record_body(
         );
     }
 
-    if rec.signers.len() != parsed_def.signatures {
+    if !signature_count_matches_definition(rec, &parsed_def) {
         return Finding::new(
             2,
             &rec.rec_ref,
