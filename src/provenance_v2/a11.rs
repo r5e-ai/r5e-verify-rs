@@ -171,10 +171,17 @@ impl A11CategoryCounts {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct A11BaselineSummary {
+    pub ok: usize,
+    pub failed: usize,
+    pub incomplete: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct A11BaselineSection {
     pub findings: Vec<ClassifiedFinding>,
-    pub summary: A11Summary,
+    pub summary: A11BaselineSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -900,17 +907,18 @@ pub(crate) fn evaluate_a11(ctx: &A11EvalContext<'_>, baseline: Report) -> A11Rep
         }
     }
 
-    let baseline_summary = A11Summary {
+    let baseline_summary = A11BaselineSummary {
         ok: baseline.summary.ok,
         failed: baseline.summary.failed,
         incomplete: baseline.summary.incomplete,
-        total: baseline.summary.ok + baseline.summary.failed + baseline.summary.incomplete,
     };
+    let baseline_total =
+        baseline_summary.ok + baseline_summary.failed + baseline_summary.incomplete;
     let total_summary = A11Summary {
         ok: baseline_summary.ok + a11_ok,
         failed: baseline_summary.failed + a11_failed,
         incomplete: baseline_summary.incomplete + a11_incomplete,
-        total: baseline_summary.total + a11_ok + a11_failed + a11_incomplete,
+        total: baseline_total + a11_ok + a11_failed + a11_incomplete,
     };
 
     let verdict = if total_summary.failed > 0 {
@@ -2282,6 +2290,8 @@ fn eval_v4_release_request_approvals(
                     ));
                     continue;
                 }
+            } else {
+                continue;
             }
         }
 
