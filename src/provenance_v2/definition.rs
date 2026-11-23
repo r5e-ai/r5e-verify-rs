@@ -1,6 +1,6 @@
 use super::canonical::{
     decode_strict_base64, encode_canonical_json, is_bytes_ref, is_event_ref, is_evidence_ref,
-    parse_canonical_json, parse_rfc3339_instant, parse_v2_integer,
+    is_salted_bytes_ref, parse_canonical_json, parse_rfc3339_instant, parse_v2_integer,
 };
 use super::crypto::{compute_keyid, is_key_admissible, is_registered_algorithm};
 use serde_json::Value;
@@ -148,16 +148,18 @@ impl RefSpec {
         })
     }
 
-    fn matches_direct(&self, s: &str) -> bool {
+    fn matches_direct(&self, s: &str, allow_salted_bytes: bool) -> bool {
         match &self.target {
-            RefTarget::Bytes => is_bytes_ref(s),
+            RefTarget::Bytes => is_bytes_ref(s) || (allow_salted_bytes && is_salted_bytes_ref(s)),
             RefTarget::Evidence => is_evidence_ref(s),
             RefTarget::Event => is_event_ref(s),
-            RefTarget::AnyOf(alts) => alts.iter().any(|alt| alt.matches_direct(s)),
+            RefTarget::AnyOf(alts) => alts
+                .iter()
+                .any(|alt| alt.matches_direct(s, allow_salted_bytes)),
         }
     }
 
-    fn matches(&self, s: &str) -> bool {
+    fn matches(&self, s: &str, allow_salted_bytes: bool) -> bool {
         if let Some(rest) = s.strip_prefix("chain:") {
             let Some((chain_name, inner_ref)) = rest.split_once('/') else {
                 return false;
@@ -166,16 +168,16 @@ impl RefSpec {
                 return false;
             }
             if self.cross_chain {
-                return self.matches_direct(inner_ref);
+                return self.matches_direct(inner_ref, allow_salted_bytes);
             }
             if let RefTarget::AnyOf(alts) = &self.target {
-                return alts
-                    .iter()
-                    .any(|alt| alt.cross_chain && alt.matches_direct(inner_ref));
+                return alts.iter().any(|alt| {
+                    alt.cross_chain && alt.matches_direct(inner_ref, allow_salted_bytes)
+                });
             }
             false
         } else {
-            self.matches_direct(s)
+            self.matches_direct(s, allow_salted_bytes)
         }
     }
 }
@@ -616,7 +618,16 @@ impl ParsedDefinition {
     }
 
     pub fn validate_body(&self, body: &Value, signers: &[String]) -> bool {
-        validate_value(&self.schema, body, signers)
+        validate_value(&self.schema, body, signers, false)
+    }
+
+    pub fn validate_body_with_salted(
+        &self,
+        body: &Value,
+        signers: &[String],
+        allow_salted_bytes: bool,
+    ) -> bool {
+        validate_value(&self.schema, body, signers, allow_salted_bytes)
     }
 }
 
@@ -699,7 +710,12 @@ fn array_items_unique(arr: &[Value]) -> bool {
     true
 }
 
-fn validate_value(node: &DefNode, value: &Value, signers: &[String]) -> bool {
+fn validate_value(
+    node: &DefNode,
+    value: &Value,
+    signers: &[String],
+    allow_salted_bytes: bool,
+) -> bool {
     if !matches_def_types(&node.types, value) {
         return false;
     }
@@ -718,16 +734,25 @@ fn validate_value(node: &DefNode, value: &Value, signers: &[String]) -> bool {
                 return false;
             }
             if let Some(ref_spec) = &node.ref_spec {
-                if node.types.contains(&DefType::Ref) && !ref_spec.matches(s) {
+                if node.types.contains(&DefType::Ref) && !ref_spec.matches(s, allow_salted_bytes) {
                     return false;
                 }
             } else if node.is_exclusively_type(DefType::Ref)
-                && !(is_bytes_ref(s) || is_evidence_ref(s) || is_event_ref(s))
+                && !(is_bytes_ref(s)
+                    || (allow_salted_bytes && is_salted_bytes_ref(s))
+                    || is_evidence_ref(s)
+                    || is_event_ref(s))
             {
                 return false;
             }
             if let Some((compiled, is_ts)) = &node.pattern {
-                if !compiled.is_match(s) {
+                let matched = compiled.is_match(s)
+                    || (allow_salted_bytes
+                        && !*is_ts
+                        && is_salted_bytes_ref(s)
+                        && s.strip_prefix("bytes:sha256+salt:")
+                            .is_some_and(|hex| compiled.is_match(&format!("bytes:sha256:{hex}"))));
+                if !matched {
                     return false;
                 }
                 if *is_ts && parse_rfc3339_instant(s, Some(9), false).is_none() {
@@ -758,7 +783,7 @@ fn validate_value(node: &DefNode, value: &Value, signers: &[String]) -> bool {
         Value::Array(arr) => {
             if let Some(items_node) = &node.items {
                 for item in arr {
-                    if !validate_value(items_node, item, signers) {
+                    if !validate_value(items_node, item, signers, allow_salted_bytes) {
                         return false;
                     }
                 }
@@ -794,14 +819,15 @@ fn validate_value(node: &DefNode, value: &Value, signers: &[String]) -> bool {
             }
             for (k, prop_node) in &node.properties {
                 if let Some(v) = obj.get(k)
-                    && !validate_value(prop_node, v, signers)
+                    && !validate_value(prop_node, v, signers, allow_salted_bytes)
                 {
                     return false;
                 }
             }
             if let Some(values_node) = &node.values {
                 for (k, v) in obj {
-                    if !node.properties.contains_key(k) && !validate_value(values_node, v, signers)
+                    if !node.properties.contains_key(k)
+                        && !validate_value(values_node, v, signers, allow_salted_bytes)
                     {
                         return false;
                     }

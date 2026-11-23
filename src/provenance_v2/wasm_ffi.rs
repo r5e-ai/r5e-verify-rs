@@ -1,4 +1,7 @@
-use super::{R5E_API_CHAIN_REF, R5E_API_PUBLISHER_PIN, VerifyOptions, verify_bundle_bytes};
+use super::{
+    R5E_API_CHAIN_REF, R5E_API_PUBLISHER_PIN, TrustedCheckpoint, VerifyOptions,
+    verify_bundle_auto_bytes,
+};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -19,6 +22,8 @@ struct WasmOptionsInput {
     trusted_chain: Option<String>,
     #[serde(default)]
     min_start_seq: Option<i64>,
+    #[serde(default)]
+    trusted_checkpoints: Vec<TrustedCheckpoint>,
     #[serde(default)]
     installed_definitions: Vec<String>,
 }
@@ -71,6 +76,7 @@ pub fn verify_v2_ffi_bytes(bundle_bytes: &[u8], opts_bytes: &[u8]) -> Vec<u8> {
                     }
                     opts.min_start_seq = Some(ms as u64);
                 }
+                opts.trusted_checkpoints = parsed.trusted_checkpoints;
                 for def_str in parsed.installed_definitions {
                     opts.insert_installed_definition_bytes(def_str.into_bytes());
                 }
@@ -86,7 +92,7 @@ pub fn verify_v2_ffi_bytes(bundle_bytes: &[u8], opts_bytes: &[u8]) -> Vec<u8> {
         }
     }
 
-    match verify_bundle_bytes(bundle_bytes, &opts) {
+    match verify_bundle_auto_bytes(bundle_bytes, &opts) {
         Ok(report) => {
             let canonical_json = report.to_canonical_json();
             serde_json::to_vec(&json!({
@@ -94,7 +100,7 @@ pub fn verify_v2_ffi_bytes(bundle_bytes: &[u8], opts_bytes: &[u8]) -> Vec<u8> {
                 "sound": report.is_sound(),
                 "established": report.is_established(),
                 "exitCode": report.exit_code(false),
-                "report": report,
+                "report": report.to_value(),
                 "canonicalReportJson": canonical_json,
             }))
             .unwrap_or_default()

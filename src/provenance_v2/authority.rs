@@ -1143,6 +1143,7 @@ fn has_no_standing(
 fn collect_authority_records(
     opened_records: &[OpenedRecord],
     body_result_by_idx: &[String],
+    verified_recovery_successions: Option<&BTreeSet<String>>,
 ) -> (
     BTreeMap<String, LinkNode>,
     SuccessionIndex,
@@ -1177,12 +1178,29 @@ fn collect_authority_records(
                         .and_then(Value::as_str),
                 ) && let Some(captured_at) = parse_rfc3339_instant(cap_str, None, false)
                 {
-                    succession_edges.push(SuccessionEdge {
-                        rec_ref: rec.rec_ref.clone(),
-                        predecessor: pred.to_string(),
-                        successor: succ_kid.to_string(),
-                        captured_at,
-                    });
+                    let has_recovery = rec
+                        .payload
+                        .get("body")
+                        .and_then(|b| b.get("recoveryProof"))
+                        .is_some();
+                    let admitted = if has_recovery {
+                        rec.signers.len() == 1
+                            && rec.signers[0] == succ_kid
+                            && verified_recovery_successions
+                                .is_some_and(|set| set.contains(&rec.rec_ref))
+                    } else {
+                        rec.signers.len() == 2
+                            && rec.signers[0] == pred
+                            && rec.signers[1] == succ_kid
+                    };
+                    if admitted {
+                        succession_edges.push(SuccessionEdge {
+                            rec_ref: rec.rec_ref.clone(),
+                            predecessor: pred.to_string(),
+                            successor: succ_kid.to_string(),
+                            captured_at,
+                        });
+                    }
                 }
             }
             Some(KIND_REVOCATION) => {
@@ -1443,7 +1461,7 @@ pub(crate) fn compute_qualifying_shown_times_for_roots(
         })
         .collect();
     let (valid_links, succ, auth_revocations) =
-        collect_authority_records(opened_records, body_result_by_idx);
+        collect_authority_records(opened_records, body_result_by_idx, None);
     let (_, _, _, shown_times_by_ref) = solve_revocations_and_seals(
         &valid_links,
         &succ,
@@ -1472,11 +1490,15 @@ pub(crate) fn compute_authority_findings(
     multi_sig_mismatch_by_idx: &[bool],
     seal_covered_records: &BTreeMap<String, BTreeSet<String>>,
     tenures: &[RootTenure],
+    verified_recovery_successions: Option<&BTreeSet<String>>,
     authority_ok_by_idx: &mut [bool],
     findings: &mut Vec<Finding>,
 ) -> BTreeSet<String> {
-    let (valid_links, succ, auth_revocations) =
-        collect_authority_records(opened_records, body_result_by_idx);
+    let (valid_links, succ, auth_revocations) = collect_authority_records(
+        opened_records,
+        body_result_by_idx,
+        verified_recovery_successions,
+    );
     let (target_lineages, active_rev_indices, entitled_revocations_by_target, shown_times_by_ref) =
         solve_revocations_and_seals(
             &valid_links,

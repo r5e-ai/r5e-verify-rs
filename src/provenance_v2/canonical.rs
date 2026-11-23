@@ -474,3 +474,24 @@ pub fn parse_rfc3339_instant(
 pub fn is_valid_wire_datetime(s: &str) -> bool {
     parse_rfc3339_instant(s, None, false).is_some()
 }
+
+pub fn is_valid_utc_z_datetime(s: &str) -> bool {
+    s.ends_with('Z') && parse_rfc3339_instant(s, None, false).is_some()
+}
+
+/// Fixed-time byte slice equality check for cryptographic digests and key IDs.
+pub fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= std::hint::black_box(x ^ y);
+    }
+    std::hint::black_box(diff) == 0
+}
+
+/// Fixed-time string equality check for cryptographic digests and key IDs.
+pub fn ct_eq_str(a: &str, b: &str) -> bool {
+    ct_eq_bytes(a.as_bytes(), b.as_bytes())
+}

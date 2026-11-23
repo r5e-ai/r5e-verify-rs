@@ -1,5 +1,6 @@
 use super::canonical::{
-    is_bytes_ref, is_evidence_ref, is_salted_bytes_ref, is_valid_wire_datetime, parse_v2_integer,
+    is_bytes_ref, is_evidence_ref, is_lower_hex_64, is_salted_bytes_ref, is_valid_utc_z_datetime,
+    is_valid_wire_datetime, parse_v2_integer,
 };
 use serde_json::Value;
 use std::sync::LazyLock;
@@ -49,12 +50,6 @@ pub enum WireSchemaKind {
 }
 
 pub fn validate_wire_schema(kind: WireSchemaKind, instance: &Value) -> bool {
-    if matches!(kind, WireSchemaKind::Export)
-        && let Some(obj) = instance.as_object()
-        && A11_EXPORT_MEMBERS.iter().any(|k| obj.contains_key(*k))
-    {
-        return validate_a11_export_bundle(obj);
-    }
     let root = match kind {
         WireSchemaKind::Export => &*EXPORT_SCHEMA,
         WireSchemaKind::SignedEvidence => &*SIGNED_EVIDENCE_SCHEMA,
@@ -65,14 +60,13 @@ pub fn validate_wire_schema(kind: WireSchemaKind, instance: &Value) -> bool {
     validate_against_schema(root, instance)
 }
 
-const A11_EXPORT_MEMBERS: [&str; 4] = [
-    "saltedContent",
-    "witnessReceipts",
-    "unlockLog",
-    "pinnedCheckpoints",
-];
-
-fn validate_a11_export_bundle(obj: &serde_json::Map<String, Value>) -> bool {
+/// Validates an export bundle in Amendment A11 mode: validates optional A11
+/// top-level members in full detail and validates all remaining top-level
+/// members against `export.schema.json` without cloning the bundle.
+pub fn validate_a11_export_schema(instance: &Value) -> bool {
+    let Some(obj) = instance.as_object() else {
+        return false;
+    };
     if let Some(sc) = obj.get("saltedContent")
         && !validate_salted_content_member(sc)
     {
@@ -93,14 +87,27 @@ fn validate_a11_export_bundle(obj: &serde_json::Map<String, Value>) -> bool {
     {
         return false;
     }
+    validate_node_with_skip(
+        &EXPORT_SCHEMA,
+        &EXPORT_SCHEMA,
+        instance,
+        &A11_EXPORT_MEMBERS,
+    )
+}
 
-    let mut base_obj = serde_json::Map::with_capacity(obj.len());
-    for (k, v) in obj {
-        if !A11_EXPORT_MEMBERS.contains(&k.as_str()) {
-            base_obj.insert(k.clone(), v.clone());
-        }
-    }
-    validate_against_schema(&EXPORT_SCHEMA, &Value::Object(base_obj))
+pub const A11_EXPORT_MEMBERS: [&str; 4] = [
+    "saltedContent",
+    "witnessReceipts",
+    "unlockLog",
+    "pinnedCheckpoints",
+];
+
+fn is_sha256_prefixed(s: &str) -> bool {
+    s.strip_prefix("sha256:").is_some_and(is_lower_hex_64)
+}
+
+fn is_key_id_shape(s: &str) -> bool {
+    s.starts_with("key:") && s.len() > 4
 }
 
 fn validate_salted_content_member(v: &Value) -> bool {
@@ -144,12 +151,32 @@ fn validate_witness_receipts_member(v: &Value) -> bool {
             .get("logIndex")
             .and_then(parse_v2_integer)
             .is_some_and(|n| n >= 0);
+        let logged_at_ok = eobj
+            .get("loggedAt")
+            .and_then(Value::as_str)
+            .is_some_and(is_valid_utc_z_datetime);
+        let req_hash_ok = eobj
+            .get("requestHash")
+            .and_then(Value::as_str)
+            .is_some_and(is_sha256_prefixed);
+        let req_ref_ok = eobj
+            .get("requestRef")
+            .and_then(Value::as_str)
+            .is_some_and(is_evidence_ref);
+        let sig_ok = eobj
+            .get("signature")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        let witness_key_ok = eobj
+            .get("witnessKey")
+            .and_then(Value::as_str)
+            .is_some_and(is_key_id_shape);
         if !log_index_ok
-            || !eobj.get("loggedAt").is_some_and(Value::is_string)
-            || !eobj.get("requestHash").is_some_and(Value::is_string)
-            || !eobj.get("requestRef").is_some_and(Value::is_string)
-            || !eobj.get("signature").is_some_and(Value::is_string)
-            || !eobj.get("witnessKey").is_some_and(Value::is_string)
+            || !logged_at_ok
+            || !req_hash_ok
+            || !req_ref_ok
+            || !sig_ok
+            || !witness_key_ok
         {
             return false;
         }
@@ -168,15 +195,26 @@ fn validate_unlock_log_member(v: &Value) -> bool {
         if eobj.len() != 5 {
             return false;
         }
+        let entry_id_ok = eobj
+            .get("entryId")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        let operator_key_ok = eobj
+            .get("operatorKey")
+            .and_then(Value::as_str)
+            .is_some_and(is_key_id_shape);
         let release_ref_ok = eobj
             .get("releaseRef")
-            .is_some_and(|rv| rv.is_null() || rv.is_string());
-        if !release_ref_ok
-            || !eobj.get("entryId").is_some_and(Value::is_string)
-            || !eobj.get("operatorKey").is_some_and(Value::is_string)
-            || !eobj.get("session").is_some_and(Value::is_string)
-            || !eobj.get("unlockedAt").is_some_and(Value::is_string)
-        {
+            .is_some_and(|rv| rv.is_null() || rv.as_str().is_some_and(is_evidence_ref));
+        let session_ok = eobj
+            .get("session")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        let unlocked_at_ok = eobj
+            .get("unlockedAt")
+            .and_then(Value::as_str)
+            .is_some_and(is_valid_utc_z_datetime);
+        if !entry_id_ok || !operator_key_ok || !release_ref_ok || !session_ok || !unlocked_at_ok {
             return false;
         }
     }
@@ -210,7 +248,7 @@ fn validate_pinned_checkpoints_member(v: &Value) -> bool {
 }
 
 pub fn validate_against_schema(root: &Value, instance: &Value) -> bool {
-    validate_node(root, root, instance)
+    validate_node_with_skip(root, root, instance, &[])
 }
 
 fn resolve_local_ref<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
@@ -260,6 +298,15 @@ pub fn matches_wire_pattern(pattern: &str, text: &str) -> bool {
 }
 
 fn validate_node(root: &Value, schema: &Value, instance: &Value) -> bool {
+    validate_node_with_skip(root, schema, instance, &[])
+}
+
+fn validate_node_with_skip(
+    root: &Value,
+    schema: &Value,
+    instance: &Value,
+    skip_top_keys: &[&str],
+) -> bool {
     if let Value::Bool(b) = schema {
         return *b;
     }
@@ -274,7 +321,7 @@ fn validate_node(root: &Value, schema: &Value, instance: &Value) -> bool {
         let Some(target) = resolve_local_ref(root, ref_str) else {
             return false;
         };
-        if !validate_node(root, target, instance) {
+        if !validate_node_with_skip(root, target, instance, skip_top_keys) {
             return false;
         }
     }
@@ -311,7 +358,10 @@ fn validate_node(root: &Value, schema: &Value, instance: &Value) -> bool {
         let Some(arr) = all_of.as_array() else {
             return false;
         };
-        if !arr.iter().all(|sub| validate_node(root, sub, instance)) {
+        if !arr
+            .iter()
+            .all(|sub| validate_node_with_skip(root, sub, instance, skip_top_keys))
+        {
             return false;
         }
     }
@@ -320,7 +370,10 @@ fn validate_node(root: &Value, schema: &Value, instance: &Value) -> bool {
         let Some(arr) = any_of.as_array() else {
             return false;
         };
-        if !arr.iter().any(|sub| validate_node(root, sub, instance)) {
+        if !arr
+            .iter()
+            .any(|sub| validate_node_with_skip(root, sub, instance, skip_top_keys))
+        {
             return false;
         }
     }
@@ -331,7 +384,7 @@ fn validate_node(root: &Value, schema: &Value, instance: &Value) -> bool {
         };
         let matches = arr
             .iter()
-            .filter(|sub| validate_node(root, sub, instance))
+            .filter(|sub| validate_node_with_skip(root, sub, instance, skip_top_keys))
             .count();
         if matches != 1 {
             return false;
@@ -339,14 +392,14 @@ fn validate_node(root: &Value, schema: &Value, instance: &Value) -> bool {
     }
 
     if let Some(if_schema) = smap.get("if") {
-        if validate_node(root, if_schema, instance) {
+        if validate_node_with_skip(root, if_schema, instance, skip_top_keys) {
             if let Some(then_schema) = smap.get("then")
-                && !validate_node(root, then_schema, instance)
+                && !validate_node_with_skip(root, then_schema, instance, skip_top_keys)
             {
                 return false;
             }
         } else if let Some(else_schema) = smap.get("else")
-            && !validate_node(root, else_schema, instance)
+            && !validate_node_with_skip(root, else_schema, instance, skip_top_keys)
         {
             return false;
         }
@@ -428,7 +481,14 @@ fn validate_node(root: &Value, schema: &Value, instance: &Value) -> bool {
             let Some(min_props) = parse_v2_integer(min_props_val) else {
                 return false;
             };
-            if min_props > 0 && (obj.len() as i64) < min_props {
+            let effective_len = if skip_top_keys.is_empty() {
+                obj.len()
+            } else {
+                obj.keys()
+                    .filter(|k| !skip_top_keys.contains(&k.as_str()))
+                    .count()
+            };
+            if min_props > 0 && (effective_len as i64) < min_props {
                 return false;
             }
         }
@@ -447,6 +507,9 @@ fn validate_node(root: &Value, schema: &Value, instance: &Value) -> bool {
         }
         if let Some(prop_names_schema) = smap.get("propertyNames") {
             for k in obj.keys() {
+                if !skip_top_keys.is_empty() && skip_top_keys.contains(&k.as_str()) {
+                    continue;
+                }
                 if !validate_node(root, prop_names_schema, &Value::String(k.clone())) {
                     return false;
                 }
@@ -464,6 +527,9 @@ fn validate_node(root: &Value, schema: &Value, instance: &Value) -> bool {
         }
         if let Some(addl) = smap.get("additionalProperties") {
             for (k, v) in obj {
+                if !skip_top_keys.is_empty() && skip_top_keys.contains(&k.as_str()) {
+                    continue;
+                }
                 let is_declared = props_map.is_some_and(|pm| pm.contains_key(k));
                 if !is_declared && !validate_node(root, addl, v) {
                     return false;

@@ -8,7 +8,10 @@ pub mod start;
 pub mod wasm_ffi;
 pub mod wire_schema;
 
-pub use a11::{A11Finding, A11Report, FindingCategory, classify_finding};
+pub use a11::{
+    A11BaselineSection, A11CategoryCounts, A11Finding, A11Report, A11Summary, ClassifiedFinding,
+    FindingCategory, classify_finding, is_a11_bundle,
+};
 
 use canonical::{
     MAX_SAFE_INT, bytes_ref_of, decode_base64, decode_hex_32, decode_strict_base64,
@@ -26,7 +29,7 @@ use start::PinnedChainOutcome;
 pub use start::StartSummary;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
-use wire_schema::{WireSchemaKind, validate_wire_schema};
+use wire_schema::{WireSchemaKind, validate_a11_export_schema, validate_wire_schema};
 
 pub const REPORT_FORMAT_V2: &str = "r5e.provenance-verify-report/v2";
 pub const R5E_API_CHAIN_REF: &str =
@@ -505,6 +508,13 @@ impl PublisherTrust {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedCheckpoint {
+    pub seq: u64,
+    #[serde(rename = "ref")]
+    pub rec_ref: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct VerifyOptions {
     pub trusted_profiles: BTreeSet<String>,
@@ -512,6 +522,7 @@ pub struct VerifyOptions {
     pub trusted_roots: Option<BTreeSet<String>>,
     pub trusted_chain: Option<String>,
     pub min_start_seq: Option<u64>,
+    pub trusted_checkpoints: Vec<TrustedCheckpoint>,
     pub installed_definitions: BTreeMap<String, Vec<u8>>,
     pub base_definitions: Option<BaseDefinitions>,
 }
@@ -552,7 +563,89 @@ impl VerifyOptions {
         {
             return Err(InputError("minStartSeq must be an integer >= 2".into()));
         }
+        for tc in &self.trusted_checkpoints {
+            if tc.seq < 1 || tc.seq > MAX_SAFE_INT as u64 {
+                return Err(InputError(
+                    "trustedCheckpoints[].seq must be an integer >= 1".into(),
+                ));
+            }
+            if !is_evidence_ref(&tc.rec_ref) {
+                return Err(InputError(
+                    "trustedCheckpoints[].ref must be an evidence:sha256:<64 lowercase hex> reference"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
+    }
+}
+
+/// Unified report returned by automatic entry points (`verify_bundle_auto_bytes` /
+/// `verify_bundle_auto_value`): returns the unchanged baseline `Report` for pre-A11
+/// bundles and the full `A11Report` whenever any A11 feature is present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnifiedReport {
+    Baseline(Report),
+    A11(A11Report),
+}
+
+impl UnifiedReport {
+    pub fn to_value(&self) -> Value {
+        match self {
+            Self::Baseline(r) => r.to_value(),
+            Self::A11(r) => r.to_value(),
+        }
+    }
+
+    pub fn to_canonical_json(&self) -> String {
+        match self {
+            Self::Baseline(r) => r.to_canonical_json(),
+            Self::A11(r) => r.to_canonical_json(),
+        }
+    }
+
+    pub fn is_sound(&self) -> bool {
+        match self {
+            Self::Baseline(r) => r.is_sound(),
+            Self::A11(r) => r.verdict != "failed",
+        }
+    }
+
+    pub fn is_established(&self) -> bool {
+        match self {
+            Self::Baseline(r) => r.is_established(),
+            Self::A11(r) => r.verdict == "ok",
+        }
+    }
+
+    pub fn exit_code(&self, allow_incomplete: bool) -> i32 {
+        match self {
+            Self::Baseline(r) => r.exit_code(allow_incomplete),
+            Self::A11(r) => r.exit_code(allow_incomplete),
+        }
+    }
+}
+
+/// Parses raw bundle JSON bytes strictly, automatically detects Amendment A11
+/// bundles, and runs the full A11 verifier on A11 bundles or the unchanged
+/// baseline Provenance v2 verifier on pre-A11 bundles.
+pub fn verify_bundle_auto_bytes(
+    bundle_bytes: &[u8],
+    opts: &VerifyOptions,
+) -> Result<UnifiedReport, InputError> {
+    opts.validate()?;
+    let bundle_val = strict_json_parse(bundle_bytes)
+        .ok_or_else(|| InputError("bundle is not readable JSON".into()))?;
+    Ok(verify_bundle_auto_value(&bundle_val, opts))
+}
+
+/// Pure automatic routing entry point: runs A11 verification when the bundle
+/// carries any A11 feature, and unchanged baseline verification otherwise.
+pub fn verify_bundle_auto_value(bundle: &Value, opts: &VerifyOptions) -> UnifiedReport {
+    if is_a11_bundle(bundle) {
+        UnifiedReport::A11(verify_bundle_a11_value(bundle, opts))
+    } else {
+        UnifiedReport::Baseline(verify_bundle_value(bundle, opts))
     }
 }
 
@@ -672,13 +765,14 @@ struct CoreVerifyOutput {
     opened_records: Vec<OpenedRecord>,
     opened_by_ref: BTreeMap<String, usize>,
     body_result_by_idx: Vec<String>,
+    authority_ok_by_idx: Vec<bool>,
     available_keys: BTreeMap<String, AvailableKey>,
     valid_blobs: BTreeMap<String, Vec<u8>>,
 }
 
 /// Core pure verification entry point (`VERIFY-V2.md` §§3–9).
 pub fn verify_bundle_value(bundle: &Value, opts: &VerifyOptions) -> Report {
-    verify_bundle_core(bundle, opts).report
+    verify_bundle_core(bundle, opts, false).report
 }
 
 /// Core pure verification entry point with Amendment A11 rules (V1–V11).
@@ -687,27 +781,36 @@ pub fn verify_bundle_a11_value(bundle: &Value, opts: &VerifyOptions) -> A11Repor
         .base_definitions
         .as_ref()
         .unwrap_or_else(|| default_base_definitions());
-    let core = verify_bundle_core(bundle, opts);
+    let a11_active = is_a11_bundle(bundle);
+    let core = verify_bundle_core(bundle, opts, a11_active);
     let ctx = a11::A11EvalContext {
         bundle,
         opened_records: &core.opened_records,
         opened_by_ref: &core.opened_by_ref,
         body_result_by_idx: &core.body_result_by_idx,
+        authority_ok_by_idx: &core.authority_ok_by_idx,
         available_keys: &core.available_keys,
         valid_blobs: &core.valid_blobs,
         base_defs,
+        trusted_checkpoints: &opts.trusted_checkpoints,
+        a11_active,
     };
     a11::evaluate_a11(&ctx, core.report)
 }
 
-fn verify_bundle_core(bundle: &Value, opts: &VerifyOptions) -> CoreVerifyOutput {
+fn verify_bundle_core(bundle: &Value, opts: &VerifyOptions, a11_mode: bool) -> CoreVerifyOutput {
     let base_defs = opts
         .base_definitions
         .as_ref()
         .unwrap_or_else(|| default_base_definitions());
 
     // §3. The bundle
-    if !validate_wire_schema(WireSchemaKind::Export, bundle) {
+    let export_ok = if a11_mode {
+        validate_a11_export_schema(bundle)
+    } else {
+        validate_wire_schema(WireSchemaKind::Export, bundle)
+    };
+    if !export_ok {
         return CoreVerifyOutput {
             report: Report::from_findings(vec![Finding::new(
                 1,
@@ -720,6 +823,7 @@ fn verify_bundle_core(bundle: &Value, opts: &VerifyOptions) -> CoreVerifyOutput 
             opened_records: Vec::new(),
             opened_by_ref: BTreeMap::new(),
             body_result_by_idx: Vec::new(),
+            authority_ok_by_idx: Vec::new(),
             available_keys: BTreeMap::new(),
             valid_blobs: BTreeMap::new(),
         };
@@ -743,6 +847,7 @@ fn verify_bundle_core(bundle: &Value, opts: &VerifyOptions) -> CoreVerifyOutput 
                     opened_records: Vec::new(),
                     opened_by_ref: BTreeMap::new(),
                     body_result_by_idx: Vec::new(),
+                    authority_ok_by_idx: Vec::new(),
                     available_keys: BTreeMap::new(),
                     valid_blobs: BTreeMap::new(),
                 };
@@ -1061,7 +1166,7 @@ fn verify_bundle_core(bundle: &Value, opts: &VerifyOptions) -> CoreVerifyOutput 
     let mut multi_sig_mismatch_by_idx: Vec<bool> = Vec::with_capacity(opened_records.len());
     for rec in &opened_records {
         // §6.1 & §6.2: `body` finding
-        let body_finding = check_record_body(rec, base_defs, opts, &valid_blobs);
+        let body_finding = check_record_body(rec, base_defs, opts, &valid_blobs, a11_mode);
         body_result_by_idx.push(body_finding.result.clone());
         findings.push(body_finding);
         multi_sig_mismatch_by_idx.push(has_multi_signer_count_mismatch(
@@ -1485,6 +1590,19 @@ fn verify_bundle_core(bundle: &Value, opts: &VerifyOptions) -> CoreVerifyOutput 
     );
     findings.extend(start_eval.findings);
 
+    // Pre-verify A11 recovery-form Successions so unverified recoveries never enter
+    // baseline A5 SuccessionIndex.
+    let verified_recovery_successions = if a11_mode {
+        Some(a11::collect_verified_recovery_successions(
+            &opened_records,
+            &opened_by_ref,
+            &available_keys,
+            base_defs,
+        ))
+    } else {
+        None
+    };
+
     // §6.3a / §6.3b / A7 §3: Authority from trusted roots (A5) or pinned chain (A6).
     let a5_qualifying_seal_refs = if opts.trusted_roots.is_some() {
         authority::compute_authority_findings(
@@ -1495,6 +1613,7 @@ fn verify_bundle_core(bundle: &Value, opts: &VerifyOptions) -> CoreVerifyOutput 
             &multi_sig_mismatch_by_idx,
             &seal_covered_records,
             &start_eval.trusted_roots_tenures,
+            verified_recovery_successions.as_ref(),
             &mut authority_ok_by_idx,
             &mut findings,
         )
@@ -1509,6 +1628,7 @@ fn verify_bundle_core(bundle: &Value, opts: &VerifyOptions) -> CoreVerifyOutput 
                 &multi_sig_mismatch_by_idx,
                 &seal_covered_records,
                 &tenures,
+                verified_recovery_successions.as_ref(),
                 &mut authority_ok_by_idx,
                 &mut findings,
             ),
@@ -1530,6 +1650,7 @@ fn verify_bundle_core(bundle: &Value, opts: &VerifyOptions) -> CoreVerifyOutput 
                 &multi_sig_mismatch_by_idx,
                 &seal_covered_records,
                 &[],
+                verified_recovery_successions.as_ref(),
                 &mut authority_ok_by_idx,
                 &mut findings,
             ),
@@ -1558,6 +1679,7 @@ fn verify_bundle_core(bundle: &Value, opts: &VerifyOptions) -> CoreVerifyOutput 
         opened_records,
         opened_by_ref,
         body_result_by_idx,
+        authority_ok_by_idx,
         available_keys,
         valid_blobs,
     }
@@ -1629,6 +1751,7 @@ fn check_record_body(
     base_defs: &BaseDefinitions,
     opts: &VerifyOptions,
     valid_blobs: &BTreeMap<String, Vec<u8>>,
+    a11_mode: bool,
 ) -> Finding {
     // 1. Validate against `schemas/evidence-envelope.schema.json`.
     // Note: in `evidence-envelope.schema.json`, `causes` has `uniqueItems: true`;
@@ -1735,7 +1858,7 @@ fn check_record_body(
         );
     }
 
-    if !parsed_def.validate_body(&rec.payload["body"], &rec.signers) {
+    if !parsed_def.validate_body_with_salted(&rec.payload["body"], &rec.signers, a11_mode) {
         return Finding::new(
             2,
             &rec.rec_ref,

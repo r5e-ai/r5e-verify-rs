@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const USAGE: &str = "usage: recurse_verify [provenance] PATH_TO_BUNDLE.json\n                                     [--profile r5e-api]\n                                     [--trusted-profile REF]...\n                                     [--trusted-publisher KEYID[=DOMAINS] | --publisher KEYID[=DOMAINS]]...\n                                     [--trusted-root KEYID | --root KEYID]...\n                                     [--trusted-chain REF | --chain REF]\n                                     [--min-start-seq N]\n                                     [--establish-authority]\n                                     [--definitions-dir DIR]...\n                                     [--installed-definition PATH]...\n                                     [--report FILE]\n                                     [--allow-incomplete]";
+const USAGE: &str = "usage: recurse_verify [provenance] PATH_TO_BUNDLE.json\n                                     [--profile r5e-api]\n                                     [--trusted-profile REF]...\n                                     [--trusted-publisher KEYID[=DOMAINS] | --publisher KEYID[=DOMAINS]]...\n                                     [--trusted-root KEYID | --root KEYID]...\n                                     [--trusted-chain REF | --chain REF]\n                                     [--min-start-seq N]\n                                     [--checkpoint SEQ=REF | --checkpoint SEQ:REF]...\n                                     [--establish-authority]\n                                     [--definitions-dir DIR]...\n                                     [--installed-definition PATH]...\n                                     [--report FILE]\n                                     [--allow-incomplete]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedCliArgs {
@@ -16,6 +16,7 @@ struct ParsedCliArgs {
     trusted_roots: Vec<String>,
     trusted_chains: Vec<String>,
     min_start_seqs: Vec<String>,
+    checkpoints: Vec<String>,
     establish_authority: bool,
     definitions_dirs: Vec<String>,
     installed_def_files: Vec<String>,
@@ -30,6 +31,7 @@ fn parse_cli_args(args: &[String]) -> Result<ParsedCliArgs, String> {
     let mut trusted_roots = vec![];
     let mut trusted_chains = vec![];
     let mut min_start_seqs = vec![];
+    let mut checkpoints = vec![];
     let mut establish_authority = false;
     let mut definitions_dirs = vec![];
     let mut installed_def_files = vec![];
@@ -47,6 +49,7 @@ fn parse_cli_args(args: &[String]) -> Result<ParsedCliArgs, String> {
         "--trusted-chain",
         "--chain",
         "--min-start-seq",
+        "--checkpoint",
         "--definitions-dir",
         "--installed-definition",
         "--report",
@@ -80,6 +83,7 @@ fn parse_cli_args(args: &[String]) -> Result<ParsedCliArgs, String> {
                     "--trusted-root" | "--root" => trusted_roots.push(val),
                     "--trusted-chain" | "--chain" => trusted_chains.push(val),
                     "--min-start-seq" => min_start_seqs.push(val),
+                    "--checkpoint" => checkpoints.push(val),
                     "--definitions-dir" => definitions_dirs.push(val),
                     "--installed-definition" => installed_def_files.push(val),
                     "--report" => report_files.push(val),
@@ -88,7 +92,10 @@ fn parse_cli_args(args: &[String]) -> Result<ParsedCliArgs, String> {
                 i += 1;
                 continue;
             }
-            if !v2_flags.contains(&a.as_str()) || i + 1 >= args.len() || args[i + 1].starts_with("--") {
+            if !v2_flags.contains(&a.as_str())
+                || i + 1 >= args.len()
+                || args[i + 1].starts_with("--")
+            {
                 return Err(USAGE.into());
             }
             i += 1;
@@ -100,6 +107,7 @@ fn parse_cli_args(args: &[String]) -> Result<ParsedCliArgs, String> {
                 "--trusted-root" | "--root" => trusted_roots.push(val),
                 "--trusted-chain" | "--chain" => trusted_chains.push(val),
                 "--min-start-seq" => min_start_seqs.push(val),
+                "--checkpoint" => checkpoints.push(val),
                 "--definitions-dir" => definitions_dirs.push(val),
                 "--installed-definition" => installed_def_files.push(val),
                 "--report" => report_files.push(val),
@@ -126,11 +134,42 @@ fn parse_cli_args(args: &[String]) -> Result<ParsedCliArgs, String> {
         trusted_roots,
         trusted_chains,
         min_start_seqs,
+        checkpoints,
         establish_authority,
         definitions_dirs,
         installed_def_files,
         report_files,
         allow_incomplete,
+    })
+}
+
+fn parse_checkpoint_pin(
+    raw: &str,
+) -> Result<r5e_verify_rs::provenance_v2::TrustedCheckpoint, String> {
+    let sep = raw
+        .split_once('=')
+        .or_else(|| raw.split_once(':'))
+        .ok_or_else(|| {
+            "--checkpoint must be SEQ=evidence:sha256:<64 hex> or SEQ:evidence:sha256:<64 hex>"
+                .to_string()
+        })?;
+    let (seq_str, ref_str) = sep;
+    let parsed_seq = if !seq_str.is_empty() && seq_str.bytes().all(|b| b.is_ascii_digit()) {
+        seq_str.parse::<u64>().ok()
+    } else {
+        None
+    };
+    let Some(seq) = parsed_seq.filter(|&n| {
+        (1..=r5e_verify_rs::provenance_v2::canonical::MAX_SAFE_INT as u64).contains(&n)
+    }) else {
+        return Err("--checkpoint sequence must be an integer >= 1".into());
+    };
+    if !r5e_verify_rs::provenance_v2::canonical::is_evidence_ref(ref_str) {
+        return Err("--checkpoint reference must be evidence:sha256:<64 lowercase hex>".into());
+    }
+    Ok(r5e_verify_rs::provenance_v2::TrustedCheckpoint {
+        seq,
+        rec_ref: ref_str.to_string(),
     })
 }
 
@@ -211,6 +250,7 @@ fn run_provenance_v2(parsed: ParsedCliArgs) -> Result<i32, String> {
         trusted_roots,
         mut trusted_chains,
         min_start_seqs,
+        checkpoints,
         establish_authority,
         definitions_dirs,
         installed_def_files,
@@ -285,6 +325,11 @@ fn run_provenance_v2(parsed: ParsedCliArgs) -> Result<i32, String> {
         };
         v2_opts.min_start_seq = Some(seq);
     }
+    for ckpt_raw in checkpoints {
+        v2_opts
+            .trusted_checkpoints
+            .push(parse_checkpoint_pin(&ckpt_raw)?);
+    }
     v2_opts.validate().map_err(|e| e.to_string())?;
     for d in definitions_dirs {
         load_definitions_dir(&d, &mut v2_opts)?;
@@ -296,7 +341,7 @@ fn run_provenance_v2(parsed: ParsedCliArgs) -> Result<i32, String> {
 
     let bundle_bytes =
         std::fs::read(&bundle_path).map_err(|_| format!("cannot read bundle at {bundle_path}"))?;
-    let report = r5e_verify_rs::provenance_v2::verify_bundle_bytes(&bundle_bytes, &v2_opts)
+    let report = r5e_verify_rs::provenance_v2::verify_bundle_auto_bytes(&bundle_bytes, &v2_opts)
         .map_err(|e| format!("{bundle_path}: {e}"))?;
     let canonical = report.to_canonical_json();
     if let Some(ref out_path) = report_out {

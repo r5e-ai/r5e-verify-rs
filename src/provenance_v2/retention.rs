@@ -93,21 +93,31 @@ fn collect_bytes_refs(val: &Value, out: &mut BTreeSet<String>) {
     }
 }
 
+const KIND_RELEASE_RECEIPT: &str = "provenance.r5e.io/v2/ReleaseReceipt";
+
 /// `A7` §4.4: Collects distinct `bytes:sha256:<64 hex>` references anywhere in `R.body`,
-/// excluding `R.body.targets` when `R` is `RetentionHold` or `PayloadDisposition`.
+/// excluding `R.body.targets` when `R` is `RetentionHold` or `PayloadDisposition`,
+/// and excluding `releasedFingerprint` / `witnessReceiptRef` on `ReleaseReceipt`.
 fn collect_record_content_refs(rec: &OpenedRecord) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let Some(body_val) = rec.payload.get("body") else {
         return out;
     };
+    let kp = rec.kind_path();
     let exclude_targets = matches!(
-        rec.kind_path().as_deref(),
+        kp.as_deref(),
         Some(KIND_RETENTION_HOLD | KIND_PAYLOAD_DISPOSITION)
     );
-    if exclude_targets {
+    let exclude_release_receipt_fields = kp.as_deref() == Some(KIND_RELEASE_RECEIPT);
+    if exclude_targets || exclude_release_receipt_fields {
         if let Some(map) = body_val.as_object() {
             for (k, v) in map {
-                if k == "targets" {
+                if exclude_targets && k == "targets" {
+                    continue;
+                }
+                if exclude_release_receipt_fields
+                    && (k == "releasedFingerprint" || k == "witnessReceiptRef")
+                {
                     continue;
                 }
                 collect_bytes_refs(v, &mut out);
